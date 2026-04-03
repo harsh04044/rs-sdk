@@ -60,21 +60,29 @@ impl BaseTransport {
     pub async fn subscribe_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
         let p_tag = pubkey.to_hex();
 
-        // Ephemeral ContextVM messages — safe to use since:now()
         let ephemeral_filter = Filter::new()
             .kind(Kind::Custom(CTXVM_MESSAGES_KIND))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
             .since(Timestamp::now());
 
-        // NIP-59 gift wraps — timestamps are randomized (up to ±48h or more),
-        // so we must NOT use since:now(). Limit to recent window instead.
-        let two_days_ago = Timestamp::from(Timestamp::now().as_u64().saturating_sub(2 * 24 * 3600));
+        let now = Timestamp::now();
         let gift_wrap_filter = Filter::new()
             .kind(Kind::Custom(GIFT_WRAP_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
-            .since(two_days_ago);
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
+            .since(now);
 
-        self.relay_pool.subscribe(vec![ephemeral_filter, gift_wrap_filter]).await
+        let ephemeral_gift_wrap_filter = Filter::new()
+            .kind(Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
+            .since(now);
+
+        self.relay_pool
+            .subscribe(vec![
+                ephemeral_filter,
+                gift_wrap_filter,
+                ephemeral_gift_wrap_filter,
+            ])
+            .await
     }
 
     /// Convert a Nostr event to an MCP message with validation.
@@ -169,7 +177,6 @@ impl BaseTransport {
 mod tests {
     use super::*;
     use crate::core::types::*;
-    use nostr_sdk::prelude::*;
 
     // Test should_encrypt logic without constructing full BaseTransport
     fn should_encrypt(mode: EncryptionMode, kind: u16, is_encrypted: Option<bool>) -> bool {
