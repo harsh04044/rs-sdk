@@ -45,6 +45,9 @@ pub mod relay;
 pub mod signer;
 pub mod transport;
 
+#[cfg(feature = "rmcp")]
+pub mod rmcp_transport;
+
 // Re-export commonly used types
 pub use core::error::{Error, Result};
 pub use core::types::{
@@ -55,3 +58,6 @@ pub use discovery::ServerAnnouncement;
 pub use relay::RelayPool;
 pub use transport::client::{NostrClientTransport, NostrClientTransportConfig};
 pub use transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
+
+#[cfg(feature = "rmcp")]
+pub use rmcp;
