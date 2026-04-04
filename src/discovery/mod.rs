@@ -64,8 +64,7 @@ pub async fn discover_servers(
 
     let mut announcements = Vec::new();
     for event in events {
-        let server_info: ServerInfo =
-            serde_json::from_str(&event.content).unwrap_or_default();
+        let server_info: ServerInfo = serde_json::from_str(&event.content).unwrap_or_default();
         announcements.push(ServerAnnouncement {
             pubkey: event.pubkey.to_hex(),
             pubkey_parsed: event.pubkey,
@@ -120,6 +119,50 @@ pub async fn discover_resource_templates(
     .await
 }
 
+/// Discover tools and parse them into rmcp typed descriptors.
+#[cfg(feature = "rmcp")]
+pub async fn discover_tools_typed(
+    client: &Arc<Client>,
+    server_pubkey: &PublicKey,
+    relay_urls: &[String],
+) -> Result<Vec<rmcp::model::Tool>> {
+    let raw = discover_tools(client, server_pubkey, relay_urls).await?;
+    parse_typed_list(raw)
+}
+
+/// Discover resources and parse them into rmcp typed descriptors.
+#[cfg(feature = "rmcp")]
+pub async fn discover_resources_typed(
+    client: &Arc<Client>,
+    server_pubkey: &PublicKey,
+    relay_urls: &[String],
+) -> Result<Vec<rmcp::model::Resource>> {
+    let raw = discover_resources(client, server_pubkey, relay_urls).await?;
+    parse_typed_list(raw)
+}
+
+/// Discover prompts and parse them into rmcp typed descriptors.
+#[cfg(feature = "rmcp")]
+pub async fn discover_prompts_typed(
+    client: &Arc<Client>,
+    server_pubkey: &PublicKey,
+    relay_urls: &[String],
+) -> Result<Vec<rmcp::model::Prompt>> {
+    let raw = discover_prompts(client, server_pubkey, relay_urls).await?;
+    parse_typed_list(raw)
+}
+
+/// Discover resource templates and parse them into rmcp typed descriptors.
+#[cfg(feature = "rmcp")]
+pub async fn discover_resource_templates_typed(
+    client: &Arc<Client>,
+    server_pubkey: &PublicKey,
+    relay_urls: &[String],
+) -> Result<Vec<rmcp::model::ResourceTemplate>> {
+    let raw = discover_resource_templates(client, server_pubkey, relay_urls).await?;
+    parse_typed_list(raw)
+}
+
 // ── Internal ────────────────────────────────────────────────────────
 
 async fn fetch_list(
@@ -153,6 +196,20 @@ async fn fetch_list(
         .unwrap_or_default())
 }
 
+#[cfg(feature = "rmcp")]
+fn parse_typed_list<T>(raw: Vec<serde_json::Value>) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut parsed = Vec::new();
+    for item in raw {
+        let value = serde_json::from_value(item)
+            .map_err(|e| Error::Other(format!("Failed to parse typed discovery item: {e}")))?;
+        parsed.push(value);
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,7 +232,10 @@ mod tests {
         assert_eq!(parsed.version, Some("1.0.0".to_string()));
         assert_eq!(parsed.about, Some("A test MCP server".to_string()));
         assert_eq!(parsed.website, Some("https://example.com".to_string()));
-        assert_eq!(parsed.picture, Some("https://example.com/pic.png".to_string()));
+        assert_eq!(
+            parsed.picture,
+            Some("https://example.com/pic.png".to_string())
+        );
     }
 
     #[test]
@@ -222,7 +282,8 @@ mod tests {
             },
             event_id: EventId::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000001",
-            ).unwrap(),
+            )
+            .unwrap(),
             created_at: Timestamp::now(),
         };
 

@@ -34,9 +34,7 @@ impl NostrMCPProxy {
     }
 
     /// Start the proxy. Returns a receiver for incoming responses/notifications.
-    pub async fn start(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>> {
+    pub async fn start(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>> {
         if self.is_running {
             return Err(Error::Other("Proxy already running".to_string()));
         }
@@ -70,6 +68,32 @@ impl NostrMCPProxy {
     }
 }
 
+#[cfg(feature = "rmcp")]
+impl NostrMCPProxy {
+    /// Start a proxy directly from an rmcp client handler.
+    ///
+    /// This additive API keeps the existing `new/start/send` flow intact,
+    /// while allowing rmcp-first usage through the worker adapter.
+    pub async fn serve_client_handler<T, H>(
+        signer: T,
+        config: ProxyConfig,
+        handler: H,
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, H>>
+    where
+        T: nostr_sdk::prelude::IntoNostrSigner,
+        H: rmcp::ClientHandler,
+    {
+        use crate::rmcp_transport::NostrClientWorker;
+        use rmcp::ServiceExt;
+
+        let worker = NostrClientWorker::new(signer, config.nostr_config).await?;
+        handler
+            .serve(worker)
+            .await
+            .map_err(|e| Error::Other(format!("rmcp client initialization failed: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,9 +116,15 @@ mod tests {
 
         let config = ProxyConfig { nostr_config };
 
-        assert_eq!(config.nostr_config.relay_urls, vec!["wss://relay.example.com"]);
+        assert_eq!(
+            config.nostr_config.relay_urls,
+            vec!["wss://relay.example.com"]
+        );
         assert_eq!(config.nostr_config.server_pubkey, server_pubkey);
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Required);
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Required
+        );
         assert!(config.nostr_config.is_stateless);
         assert_eq!(config.nostr_config.timeout, Duration::from_secs(60));
     }
@@ -105,6 +135,9 @@ mod tests {
             nostr_config: NostrClientTransportConfig::default(),
         };
         assert!(!config.nostr_config.is_stateless);
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Optional
+        );
     }
 }

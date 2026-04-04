@@ -40,9 +40,7 @@ impl NostrMCPGateway {
     ///
     /// The caller is responsible for processing requests and calling
     /// `send_response` for each one.
-    pub async fn start(
-        &mut self,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
+    pub async fn start(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
         if self.is_running {
             return Err(Error::Other("Gateway already running".to_string()));
         }
@@ -81,6 +79,32 @@ impl NostrMCPGateway {
     }
 }
 
+#[cfg(feature = "rmcp")]
+impl NostrMCPGateway {
+    /// Start a gateway directly from an rmcp server handler.
+    ///
+    /// This additive API keeps the existing `new/start/send_response` flow intact,
+    /// while allowing rmcp-first usage through the worker adapter.
+    pub async fn serve_handler<T, H>(
+        signer: T,
+        config: GatewayConfig,
+        handler: H,
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleServer, H>>
+    where
+        T: nostr_sdk::prelude::IntoNostrSigner,
+        H: rmcp::ServerHandler,
+    {
+        use crate::rmcp_transport::NostrServerWorker;
+        use rmcp::ServiceExt;
+
+        let worker = NostrServerWorker::new(signer, config.nostr_config).await?;
+        handler
+            .serve(worker)
+            .await
+            .map_err(|e| Error::Other(format!("rmcp server initialization failed: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,11 +131,27 @@ mod tests {
 
         let config = GatewayConfig { nostr_config };
 
-        assert_eq!(config.nostr_config.relay_urls, vec!["wss://relay.example.com"]);
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Required);
+        assert_eq!(
+            config.nostr_config.relay_urls,
+            vec!["wss://relay.example.com"]
+        );
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Required
+        );
         assert!(config.nostr_config.is_announced_server);
         assert_eq!(config.nostr_config.allowed_public_keys.len(), 1);
-        assert!(config.nostr_config.server_info.as_ref().unwrap().name.as_ref().unwrap() == "Test Gateway");
+        assert!(
+            config
+                .nostr_config
+                .server_info
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap()
+                == "Test Gateway"
+        );
     }
 
     #[test]
@@ -119,7 +159,10 @@ mod tests {
         let config = GatewayConfig {
             nostr_config: NostrServerTransportConfig::default(),
         };
-        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(
+            config.nostr_config.encryption_mode,
+            EncryptionMode::Optional
+        );
         assert!(!config.nostr_config.is_announced_server);
     }
 }
