@@ -4,9 +4,11 @@
 //! kind 25910 events, correlates responses via `e` tag.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lru::LruCache;
 use nostr_sdk::prelude::*;
 use tokio::sync::RwLock;
 
@@ -59,6 +61,10 @@ pub struct NostrClientTransport {
     server_pubkey: PublicKey,
     /// Pending request event IDs awaiting responses.
     pending_requests: Arc<RwLock<HashSet<String>>>,
+    /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
+    /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
+    /// so failed decrypt/verify can be retried on redelivery.
+    seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     /// Channel for receiving processed MCP messages from the event loop.
     message_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -91,6 +97,9 @@ impl NostrClientTransport {
             error
         })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+        )));
 
         tracing::info!(
             target: LOG_TARGET,
@@ -108,6 +117,7 @@ impl NostrClientTransport {
             config,
             server_pubkey,
             pending_requests: Arc::new(RwLock::new(HashSet::new())),
+            seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
         })
@@ -160,9 +170,18 @@ impl NostrClientTransport {
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
+        let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
-            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
+            Self::event_loop(
+                client,
+                pending,
+                server_pubkey,
+                tx,
+                encryption_mode,
+                seen_gift_wrap_ids,
+            )
+            .await;
         });
 
         tracing::info!(
@@ -266,6 +285,7 @@ impl NostrClientTransport {
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         _encryption_mode: EncryptionMode,
+        seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = client.notifications();
 
@@ -276,6 +296,20 @@ impl NostrClientTransport {
                     == Kind::Custom(GIFT_WRAP_KIND)
                     || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
                 {
+                    {
+                        let guard = match seen_gift_wrap_ids.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if guard.contains(&event.id) {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                event_id = %event.id.to_hex(),
+                                "Skipping duplicate gift-wrap (outer id)"
+                            );
+                            continue;
+                        }
+                    }
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
                         Ok(s) => s,
@@ -297,6 +331,13 @@ impl NostrClientTransport {
                                             "Inner event signature verification failed: {e}"
                                         );
                                         continue;
+                                    }
+                                    {
+                                        let mut guard = match seen_gift_wrap_ids.lock() {
+                                            Ok(g) => g,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        guard.put(event.id, ());
                                     }
                                     let e_tag = serializers::get_tag_value(&inner.tags, "e");
                                     (inner.content, inner.pubkey, e_tag)
