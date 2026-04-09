@@ -5,9 +5,11 @@
 //! server announcements.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lru::LruCache;
 use nostr_sdk::prelude::*;
 use tokio::sync::RwLock;
 
@@ -69,6 +71,10 @@ pub struct NostrServerTransport {
     sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
     /// Reverse lookup: event_id → client_pubkey_hex
     event_to_client: Arc<RwLock<HashMap<String, String>>>,
+    /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
+    /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
+    /// so failed decrypt/verify can be retried on redelivery.
+    seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     /// Channel for incoming MCP messages (consumed by the MCP server).
     message_tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>>,
@@ -104,6 +110,9 @@ impl NostrServerTransport {
             error
         })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+        )));
 
         tracing::info!(
             target: LOG_TARGET,
@@ -121,6 +130,7 @@ impl NostrServerTransport {
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_to_client: Arc::new(RwLock::new(HashMap::new())),
+            seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
         })
@@ -175,6 +185,7 @@ impl NostrServerTransport {
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
+        let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
             Self::event_loop(
@@ -185,6 +196,7 @@ impl NostrServerTransport {
                 allowed,
                 excluded,
                 encryption_mode,
+                seen_gift_wrap_ids,
             )
             .await;
         });
@@ -585,6 +597,7 @@ impl NostrServerTransport {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         client: Arc<Client>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
@@ -593,6 +606,7 @@ impl NostrServerTransport {
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
+        seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = client.notifications();
 
@@ -610,6 +624,20 @@ impl NostrServerTransport {
                             "Received encrypted message but encryption is disabled"
                         );
                         continue;
+                    }
+                    {
+                        let guard = match seen_gift_wrap_ids.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if guard.contains(&event.id) {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                event_id = %event.id.to_hex(),
+                                "Skipping duplicate gift-wrap (outer id)"
+                            );
+                            continue;
+                        }
                     }
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
@@ -635,6 +663,13 @@ impl NostrServerTransport {
                                             "Inner event signature verification failed: {e}"
                                         );
                                         continue;
+                                    }
+                                    {
+                                        let mut guard = match seen_gift_wrap_ids.lock() {
+                                            Ok(g) => g,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        guard.put(event.id, ());
                                     }
                                     (
                                         inner.content,
