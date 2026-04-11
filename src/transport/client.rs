@@ -16,7 +16,7 @@ use crate::core::serializers;
 use crate::core::types::*;
 use crate::core::validation;
 use crate::encryption;
-use crate::relay::RelayPool;
+use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 
 use crate::util::tracing_setup;
@@ -82,14 +82,15 @@ impl NostrClientTransport {
             Error::Other(format!("Invalid server pubkey: {error}"))
         })?;
 
-        let relay_pool = Arc::new(RelayPool::new(signer).await.map_err(|error| {
-            tracing::error!(
-                target: LOG_TARGET,
-                error = %error,
-                "Failed to initialize relay pool for client transport"
-            );
-            error
-        })?);
+        let relay_pool: Arc<dyn RelayPoolTrait> =
+            Arc::new(RelayPool::new(signer).await.map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "Failed to initialize relay pool for client transport"
+                );
+                error
+            })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tracing::info!(
@@ -155,14 +156,14 @@ impl NostrClientTransport {
             })?;
 
         // Spawn event loop
-        let client = self.base.relay_pool.client().clone();
+        let relay_pool = Arc::clone(&self.base.relay_pool);
         let pending = self.pending_requests.clone();
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
 
         tokio::spawn(async move {
-            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
+            Self::event_loop(relay_pool, pending, server_pubkey, tx, encryption_mode).await;
         });
 
         tracing::info!(
@@ -261,13 +262,13 @@ impl NostrClientTransport {
     }
 
     async fn event_loop(
-        client: Arc<Client>,
+        relay_pool: Arc<dyn RelayPoolTrait>,
         pending: Arc<RwLock<HashSet<String>>>,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         _encryption_mode: EncryptionMode,
     ) {
-        let mut notifications = client.notifications();
+        let mut notifications = relay_pool.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
@@ -277,7 +278,7 @@ impl NostrClientTransport {
                     || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
                 {
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
+                    let signer = match relay_pool.signer().await {
                         Ok(s) => s,
                         Err(error) => {
                             tracing::error!(
