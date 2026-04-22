@@ -2,9 +2,37 @@
 //!
 //! Wraps nostr-sdk's Client for relay connection, event publishing, and subscription.
 
+pub mod mock;
+pub use mock::MockRelayPool;
+
+use async_trait::async_trait;
+
 use crate::core::error::{Error, Result};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
+
+/// Trait abstracting relay pool operations, enabling dependency injection and testing.
+#[async_trait]
+pub trait RelayPoolTrait: Send + Sync {
+    /// Connect to the given relay URLs.
+    async fn connect(&self, relay_urls: &[String]) -> Result<()>;
+    /// Disconnect from all relays.
+    async fn disconnect(&self) -> Result<()>;
+    /// Publish a pre-built event to relays.
+    async fn publish_event(&self, event: &Event) -> Result<EventId>;
+    /// Build, sign, and publish an event from a builder.
+    async fn publish(&self, builder: EventBuilder) -> Result<EventId>;
+    /// Sign an event builder without publishing.
+    async fn sign(&self, builder: EventBuilder) -> Result<Event>;
+    /// Get the signer associated with this relay pool.
+    async fn signer(&self) -> Result<Arc<dyn NostrSigner>>;
+    /// Get notifications receiver for event streaming.
+    fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification>;
+    /// Get the public key of the signer.
+    async fn public_key(&self) -> Result<PublicKey>;
+    /// Subscribe to events matching filters.
+    async fn subscribe(&self, filters: Vec<Filter>) -> Result<()>;
+}
 
 /// Relay pool wrapper for managing Nostr relay connections.
 pub struct RelayPool {
@@ -104,5 +132,47 @@ impl RelayPool {
                 .map_err(|e| Error::Transport(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RelayPoolTrait for RelayPool {
+    async fn connect(&self, relay_urls: &[String]) -> Result<()> {
+        RelayPool::connect(self, relay_urls).await
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        RelayPool::disconnect(self).await
+    }
+
+    async fn publish_event(&self, event: &Event) -> Result<EventId> {
+        RelayPool::publish_event(self, event).await
+    }
+
+    async fn publish(&self, builder: EventBuilder) -> Result<EventId> {
+        RelayPool::publish(self, builder).await
+    }
+
+    async fn sign(&self, builder: EventBuilder) -> Result<Event> {
+        RelayPool::sign(self, builder).await
+    }
+
+    async fn signer(&self) -> Result<Arc<dyn NostrSigner>> {
+        self.client
+            .signer()
+            .await
+            .map_err(|e| Error::Other(e.to_string()))
+    }
+
+    fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+        RelayPool::notifications(self)
+    }
+
+    async fn public_key(&self) -> Result<PublicKey> {
+        RelayPool::public_key(self).await
+    }
+
+    async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
+        RelayPool::subscribe(self, filters).await
     }
 }

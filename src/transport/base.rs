@@ -9,7 +9,7 @@ use crate::core::serializers;
 use crate::core::types::{EncryptionMode, JsonRpcMessage};
 use crate::core::validation;
 use crate::encryption;
-use crate::relay::RelayPool;
+use crate::relay::RelayPoolTrait;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::base";
 
@@ -20,7 +20,7 @@ const LOG_TARGET: &str = "contextvm_sdk::transport::base";
 /// and [`NostrServerTransport`](super::server::NostrServerTransport).
 pub struct BaseTransport {
     /// The relay pool for publishing and subscribing to Nostr events.
-    pub relay_pool: Arc<RelayPool>,
+    pub relay_pool: Arc<dyn RelayPoolTrait>,
     /// The encryption policy for outgoing messages.
     pub encryption_mode: EncryptionMode,
     /// Whether the transport is currently connected to relays.
@@ -125,7 +125,6 @@ impl BaseTransport {
                 serde_json::to_string(&event).map_err(|e| Error::Encryption(e.to_string()))?;
             let signer = self
                 .relay_pool
-                .client()
                 .signer()
                 .await
                 .map_err(|e| Error::Encryption(e.to_string()))?;

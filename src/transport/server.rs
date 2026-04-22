@@ -18,7 +18,7 @@ use crate::core::error::{Error, Result};
 use crate::core::types::*;
 use crate::core::validation;
 use crate::encryption;
-use crate::relay::RelayPool;
+use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 
 use crate::util::tracing_setup;
@@ -101,14 +101,15 @@ impl NostrServerTransport {
     {
         tracing_setup::init_tracer(config.log_file_path.as_deref())?;
 
-        let relay_pool = Arc::new(RelayPool::new(signer).await.map_err(|error| {
-            tracing::error!(
-                target: LOG_TARGET,
-                error = %error,
-                "Failed to initialize relay pool for server transport"
-            );
-            error
-        })?);
+        let relay_pool: Arc<dyn RelayPoolTrait> =
+            Arc::new(RelayPool::new(signer).await.map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "Failed to initialize relay pool for server transport"
+                );
+                error
+            })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
@@ -178,7 +179,7 @@ impl NostrServerTransport {
             })?;
 
         // Spawn event loop
-        let client = self.base.relay_pool.client().clone();
+        let relay_pool = Arc::clone(&self.base.relay_pool);
         let sessions = self.sessions.clone();
         let event_to_client = self.event_to_client.clone();
         let tx = self.message_tx.clone();
@@ -189,7 +190,7 @@ impl NostrServerTransport {
 
         tokio::spawn(async move {
             Self::event_loop(
-                client,
+                relay_pool,
                 sessions,
                 event_to_client,
                 tx,
@@ -599,7 +600,7 @@ impl NostrServerTransport {
 
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
-        client: Arc<Client>,
+        relay_pool: Arc<dyn RelayPoolTrait>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
         event_to_client: Arc<RwLock<HashMap<String, String>>>,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
@@ -608,7 +609,7 @@ impl NostrServerTransport {
         encryption_mode: EncryptionMode,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
-        let mut notifications = client.notifications();
+        let mut notifications = relay_pool.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
@@ -640,7 +641,7 @@ impl NostrServerTransport {
                         }
                     }
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
+                    let signer = match relay_pool.signer().await {
                         Ok(s) => s,
                         Err(error) => {
                             tracing::error!(
