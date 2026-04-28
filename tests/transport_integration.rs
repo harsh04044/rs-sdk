@@ -5,9 +5,13 @@
 //! encryption-mode enforcement, and authorization) is exercised without
 //! connecting to real relays.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use contextvm_sdk::core::constants::{
     mcp_protocol_version, CTXVM_MESSAGES_KIND, GIFT_WRAP_KIND, PROMPTS_LIST_KIND,
     RESOURCES_LIST_KIND, RESOURCETEMPLATES_LIST_KIND, SERVER_ANNOUNCEMENT_KIND, TOOLS_LIST_KIND,
@@ -24,6 +28,96 @@ use nostr_sdk::prelude::*;
 
 fn as_pool(pool: MockRelayPool) -> Arc<dyn RelayPoolTrait> {
     Arc::new(pool)
+}
+
+struct TestRelayPool {
+    inner: Arc<MockRelayPool>,
+    publish_delay: Duration,
+    failures_remaining: AtomicUsize,
+    publish_attempts: AtomicUsize,
+}
+
+impl TestRelayPool {
+    fn with_publish_delay(inner: Arc<MockRelayPool>, publish_delay: Duration) -> Self {
+        Self {
+            inner,
+            publish_delay,
+            failures_remaining: AtomicUsize::new(0),
+            publish_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_publish_failures(inner: Arc<MockRelayPool>, failures: usize) -> Self {
+        Self {
+            inner,
+            publish_delay: Duration::ZERO,
+            failures_remaining: AtomicUsize::new(failures),
+            publish_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn publish_attempts(&self) -> usize {
+        self.publish_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RelayPoolTrait for TestRelayPool {
+    async fn connect(&self, relay_urls: &[String]) -> contextvm_sdk::Result<()> {
+        self.inner.connect(relay_urls).await
+    }
+
+    async fn disconnect(&self) -> contextvm_sdk::Result<()> {
+        self.inner.disconnect().await
+    }
+
+    async fn publish_event(&self, event: &Event) -> contextvm_sdk::Result<EventId> {
+        if !self.publish_delay.is_zero() {
+            tokio::time::sleep(self.publish_delay).await;
+        }
+        self.publish_attempts.fetch_add(1, Ordering::SeqCst);
+        let should_fail = self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+        if should_fail {
+            return Err(contextvm_sdk::Error::Transport(
+                "injected publish failure".to_string(),
+            ));
+        }
+
+        self.inner.publish_event(event).await
+    }
+
+    async fn publish(&self, builder: EventBuilder) -> contextvm_sdk::Result<EventId> {
+        if !self.publish_delay.is_zero() {
+            tokio::time::sleep(self.publish_delay).await;
+        }
+        self.inner.publish(builder).await
+    }
+
+    async fn sign(&self, builder: EventBuilder) -> contextvm_sdk::Result<Event> {
+        self.inner.sign(builder).await
+    }
+
+    async fn signer(&self) -> contextvm_sdk::Result<Arc<dyn NostrSigner>> {
+        self.inner.signer().await
+    }
+
+    fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+        self.inner.notifications()
+    }
+
+    async fn public_key(&self) -> contextvm_sdk::Result<PublicKey> {
+        self.inner.public_key().await
+    }
+
+    async fn subscribe(&self, filters: Vec<Filter>) -> contextvm_sdk::Result<()> {
+        self.inner.subscribe(filters).await
+    }
 }
 
 /// Let spawned event loops call `notifications()` before we publish anything.
@@ -1794,4 +1888,234 @@ async fn response_mirrors_client_encryption_format() {
             GIFT_WRAP_KIND
         );
     }
+}
+
+// ── 26. send_response is one-shot under concurrency ────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_response_is_one_shot_under_concurrency() {
+    let (client_pool, server_pool_raw) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool_raw.mock_public_key();
+    let server_pool = Arc::new(server_pool_raw);
+
+    // Delay publish so both concurrent responders have a chance to race.
+    // Correct behavior is still one-shot: exactly one send_response succeeds.
+    let delayed_server_pool: Arc<dyn RelayPoolTrait> = Arc::new(TestRelayPool::with_publish_delay(
+        Arc::clone(&server_pool),
+        Duration::from_millis(25),
+    ));
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        delayed_server_pool,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("one-shot-req"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server to receive request")
+        .expect("server channel closed");
+
+    let response = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("placeholder"),
+        result: serde_json::json!({ "one_shot": "ok" }),
+    });
+
+    let event_id = incoming.event_id.clone();
+    let f1 = server.send_response(&event_id, response.clone());
+    let f2 = server.send_response(&event_id, response);
+    let (r1, r2) = tokio::join!(f1, f2);
+
+    assert_ne!(
+        r1.is_ok(),
+        r2.is_ok(),
+        "exactly one concurrent send_response call must succeed"
+    );
+
+    let msg = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout waiting for client to receive response")
+        .expect("client channel closed");
+    assert!(msg.is_response(), "client must receive one response");
+    assert_eq!(
+        msg.id(),
+        Some(&serde_json::json!("one-shot-req")),
+        "server must restore original request id in response"
+    );
+
+    let second = tokio::time::timeout(Duration::from_millis(200), client_rx.recv()).await;
+    assert!(
+        second.is_err(),
+        "client must not receive duplicate response"
+    );
+
+    let events = server_pool.stored_events().await;
+    let response_events = events
+        .iter()
+        .filter(|e| e.pubkey == server_pubkey && e.content.contains("\"one_shot\":\"ok\""))
+        .count();
+    assert_eq!(
+        response_events, 1,
+        "only one response event must be published"
+    );
+}
+
+// ── 27. send_response publish failure allows retry ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_response_publish_failure_allows_one_successful_retry() {
+    let (client_pool, server_pool_raw) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool_raw.mock_public_key();
+    let server_pool = Arc::new(server_pool_raw);
+    let failing_server_pool = Arc::new(TestRelayPool::with_publish_failures(
+        Arc::clone(&server_pool),
+        1,
+    ));
+    
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&failing_server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("retry-once"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server request")
+        .expect("server channel closed");
+    assert_eq!(incoming.message.method(), Some("tools/list"));
+
+    let response = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("placeholder"),
+        result: serde_json::json!({ "tools": [] }),
+    });
+
+    let stored_before_failure = server_pool.stored_events().await.len();
+    server
+        .send_response(&incoming.event_id, response.clone())
+        .await
+        .expect_err("first response publish must fail");
+
+    assert_eq!(
+        failing_server_pool.publish_attempts(),
+        1,
+        "failed response should attempt exactly one publish"
+    );
+    assert_eq!(
+        server_pool.stored_events().await.len(),
+        stored_before_failure,
+        "failed publish must not store a response event"
+    );
+
+    server
+        .send_response(&incoming.event_id, response.clone())
+        .await
+        .expect("retry must still find the route and publish");
+
+    let client_msg = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout waiting for retried response")
+        .expect("client channel closed");
+    assert!(client_msg.is_response());
+    assert_eq!(client_msg.id(), Some(&serde_json::json!("retry-once")));
+    assert_eq!(
+        failing_server_pool.publish_attempts(),
+        2,
+        "retry should perform the second and final publish"
+    );
+    assert_eq!(
+        server_pool.stored_events().await.len(),
+        stored_before_failure + 1,
+        "successful retry must publish exactly one response event"
+    );
+
+    server
+        .send_response(&incoming.event_id, response)
+        .await
+        .expect_err("route must be consumed after the successful retry");
+    assert_eq!(
+        failing_server_pool.publish_attempts(),
+        2,
+        "consumed route should fail before another publish attempt"
+    );
+    assert_eq!(
+        server_pool.stored_events().await.len(),
+        stored_before_failure + 1,
+        "post-success retry must not publish another response"
+    );
+
+    let second_delivery = tokio::time::timeout(Duration::from_millis(50), client_rx.recv()).await;
+    assert!(
+        second_delivery.is_err(),
+        "client must receive the retried response exactly once"
+    );
 }
