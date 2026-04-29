@@ -286,7 +286,9 @@ impl NostrServerTransport {
 
     /// Send a response back to the client that sent the original request.
     pub async fn send_response(&self, event_id: &str, mut response: JsonRpcMessage) -> Result<()> {
-        let client_pubkey_hex = self.event_routes.get(event_id).await.ok_or_else(|| {
+        // Consume the route up-front so only one concurrent responder can proceed
+        // for a given event_id.
+        let route = self.event_routes.pop(event_id).await.ok_or_else(|| {
             tracing::error!(
                 target: LOG_TARGET,
                 event_id = %event_id,
@@ -294,6 +296,10 @@ impl NostrServerTransport {
             );
             Error::Other(format!("No client found for event {event_id}"))
         })?;
+
+        let client_pubkey_hex = route.client_pubkey;
+        let original_request_id = route.original_request_id;
+        let progress_token = route.progress_token;
 
         let sessions = self.sessions.read().await;
         let session = sessions.get(&client_pubkey_hex).ok_or_else(|| {
@@ -306,12 +312,10 @@ impl NostrServerTransport {
         })?;
 
         // Restore original request ID
-        if let Some(original_id) = session.pending_requests.get(event_id) {
-            match &mut response {
-                JsonRpcMessage::Response(r) => r.id = original_id.clone(),
-                JsonRpcMessage::ErrorResponse(r) => r.id = original_id.clone(),
-                _ => {}
-            }
+        match &mut response {
+            JsonRpcMessage::Response(r) => r.id = original_request_id.clone(),
+            JsonRpcMessage::ErrorResponse(r) => r.id = original_request_id.clone(),
+            _ => {}
         }
 
         let is_encrypted = session.is_encrypted;
@@ -339,7 +343,8 @@ impl NostrServerTransport {
 
         let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
 
-        self.base
+        if let Err(error) = self
+            .base
             .send_mcp_message(
                 &response,
                 &client_pubkey,
@@ -349,26 +354,35 @@ impl NostrServerTransport {
                 None,
             )
             .await
-            .map_err(|error| {
-                tracing::error!(
-                    target: LOG_TARGET,
-                    error = %error,
-                    client_pubkey = %client_pubkey_hex,
-                    event_id = %event_id,
-                    "Failed to publish response message"
-                );
-                error
-            })?;
+        {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                client_pubkey = %client_pubkey_hex,
+                event_id = %event_id,
+                "Failed to publish response message"
+            );
 
-        // Clean up only after successful send
-        self.event_routes.pop(event_id).await;
+            // Re-register route on publish failure so caller can retry.
+            self.event_routes
+                .register(
+                    event_id.to_string(),
+                    client_pubkey_hex,
+                    original_request_id,
+                    progress_token,
+                )
+                .await;
+
+            return Err(error);
+        }
 
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(&client_pubkey_hex) {
             // Clean up progress token
-            if let Some(token) = session.event_to_progress_token.remove(event_id) {
+            if let Some(token) = progress_token {
                 session.pending_requests.remove(&token);
             }
+            session.event_to_progress_token.remove(event_id);
             session.pending_requests.remove(event_id);
         }
         drop(sessions);
