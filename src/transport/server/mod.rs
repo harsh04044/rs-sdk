@@ -224,6 +224,7 @@ impl NostrServerTransport {
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
+        let is_announced_server = self.config.is_announced_server;
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
@@ -235,6 +236,7 @@ impl NostrServerTransport {
                 allowed,
                 excluded,
                 encryption_mode,
+                is_announced_server,
                 seen_gift_wrap_ids,
             )
             .await;
@@ -656,6 +658,7 @@ impl NostrServerTransport {
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
+        is_announced_server: bool,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = relay_pool.notifications();
@@ -799,6 +802,57 @@ impl NostrServerTransport {
                             method = method,
                             "Unauthorized request"
                         );
+
+                        // On announced servers, send a JSON-RPC error back for
+                        // Request messages so the client doesn't hang indefinitely.
+                        if is_announced_server {
+                            if let JsonRpcMessage::Request(ref req) = mcp_msg {
+                                let error_response =
+                                    JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+                                        jsonrpc: "2.0".to_string(),
+                                        id: req.id.clone(),
+                                        error: JsonRpcError {
+                                            code: -32000,
+                                            message: "Unauthorized".to_string(),
+                                            data: None,
+                                        },
+                                    });
+
+                                if let Ok(client_pk) = PublicKey::from_hex(&sender_pubkey) {
+                                    let event_id_parsed = EventId::from_hex(&event_id)
+                                        .unwrap_or(EventId::all_zeros());
+                                    let tags = BaseTransport::create_response_tags(
+                                        &client_pk,
+                                        &event_id_parsed,
+                                    );
+
+                                    let base = BaseTransport {
+                                        relay_pool: Arc::clone(&relay_pool),
+                                        encryption_mode,
+                                        is_connected: true,
+                                    };
+                                    if let Err(e) = base
+                                        .send_mcp_message(
+                                            &error_response,
+                                            &client_pk,
+                                            CTXVM_MESSAGES_KIND,
+                                            tags,
+                                            Some(is_encrypted),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %e,
+                                            sender_pubkey = %sender_pubkey,
+                                            "Failed to send unauthorized error response"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         continue;
                     }
                 }
