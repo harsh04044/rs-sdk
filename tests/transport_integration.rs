@@ -2119,3 +2119,213 @@ async fn send_response_publish_failure_allows_one_successful_retry() {
         "client must receive the retried response exactly once"
     );
 }
+
+// ── 28. Announced server sends unauthorized error response ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announced_server_sends_unauthorized_error_response() {
+    let allowed_keys = Keys::generate(); // a DIFFERENT pubkey — client is NOT in the allowlist
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    // Announced server with an allowlist that does NOT include the client.
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
+            is_announced_server: true,
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Send a non-initialize request from the unauthorized client.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(42),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    // The server handler must NOT receive the request (it's unauthorized).
+    let server_forward = tokio::time::timeout(Duration::from_millis(300), server_rx.recv()).await;
+    assert!(
+        server_forward.is_err(),
+        "unauthorized request must not reach the server handler"
+    );
+
+    // The client MUST receive a -32000 Unauthorized error response.
+    let error_msg = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout waiting for unauthorized error response")
+        .expect("client channel closed");
+
+    match error_msg {
+        JsonRpcMessage::ErrorResponse(err) => {
+            assert_eq!(err.error.code, -32000, "error code must be -32000");
+            assert_eq!(
+                err.error.message, "Unauthorized",
+                "error message must be 'Unauthorized'"
+            );
+        }
+        other => panic!(
+            "expected ErrorResponse, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+// ── 29. Private server silently drops unauthorized request ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_server_silently_drops_unauthorized_request() {
+    let allowed_keys = Keys::generate();
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    // Private server (is_announced_server defaults to false).
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(99),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    // Server handler must not receive it.
+    let server_forward = tokio::time::timeout(Duration::from_millis(300), server_rx.recv()).await;
+    assert!(
+        server_forward.is_err(),
+        "unauthorized request must not reach the server handler"
+    );
+
+    // Client must NOT receive any error response (private server silently drops).
+    let client_response = tokio::time::timeout(Duration::from_millis(300), client_rx.recv()).await;
+    assert!(
+        client_response.is_err(),
+        "private server must silently drop unauthorized requests without sending an error"
+    );
+}
+
+// ── 30. Announced server does not error on unauthorized notification ─────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn announced_server_does_not_error_on_unauthorized_notification() {
+    let allowed_keys = Keys::generate();
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
+            is_announced_server: true,
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Send a notification (not a request) from the unauthorized client.
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/progress".to_string(),
+        params: None,
+    });
+    client.send(&notification).await.expect("send notification");
+
+    // Server handler must not receive the notification.
+    let server_forward = tokio::time::timeout(Duration::from_millis(300), server_rx.recv()).await;
+    assert!(
+        server_forward.is_err(),
+        "unauthorized notification must not reach the server handler"
+    );
+
+    // Client must NOT receive an error (notifications never get error replies).
+    let client_response = tokio::time::timeout(Duration::from_millis(300), client_rx.recv()).await;
+    assert!(
+        client_response.is_err(),
+        "announced server must not send error response for unauthorized notifications"
+    );
+}
