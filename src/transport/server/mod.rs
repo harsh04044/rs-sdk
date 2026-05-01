@@ -9,7 +9,9 @@ pub mod session_store;
 
 pub use correlation_store::{RouteEntry, ServerEventRouteStore};
 pub use session_store::{SessionSnapshot, SessionStore};
+use tokio::sync::RwLock;
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +37,8 @@ pub struct NostrServerTransportConfig {
     pub relay_urls: Vec<String>,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap kind selection policy (CEP-19).
+    pub gift_wrap_mode: GiftWrapMode,
     /// Server information for announcements.
     pub server_info: Option<ServerInfo>,
     /// Whether this server publishes public announcements (CEP-6).
@@ -56,6 +60,7 @@ impl Default for NostrServerTransportConfig {
         Self {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: None,
             is_announced_server: false,
             allowed_public_keys: Vec::new(),
@@ -69,12 +74,20 @@ impl Default for NostrServerTransportConfig {
 
 /// Server-side Nostr transport — receives MCP requests and sends responses.
 pub struct NostrServerTransport {
+    /// Relay pool for publishing and subscribing.
     base: BaseTransport,
+    /// Configuration for this server transport.
     config: NostrServerTransportConfig,
+    /// Extra common discovery tags to include in server announcements and first responses.
+    extra_common_tags: Vec<Tag>,
+    /// Pricing tags to include in announcements and capability list responses.
+    pricing_tags: Vec<Tag>,
     /// Client sessions.
     sessions: SessionStore,
     /// Reverse lookup: event_id → client route.
     event_routes: ServerEventRouteStore,
+    /// CEP-19: Track the incoming gift-wrap kind per request for mirroring.
+    request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -124,6 +137,7 @@ impl NostrServerTransport {
             relay_count = config.relay_urls.len(),
             announced = config.is_announced_server,
             encryption_mode = ?config.encryption_mode,
+            gift_wrap_mode = ?config.gift_wrap_mode,
             "Created server transport"
         );
         Ok(Self {
@@ -133,8 +147,11 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
+            extra_common_tags: Vec::new(),
+            pricing_tags: Vec::new(),
             sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
+            request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
             message_tx: tx,
             message_rx: Some(rx),
@@ -167,7 +184,10 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
+            extra_common_tags: Vec::new(),
+            pricing_tags: Vec::new(),
             sessions: SessionStore::new(),
+            request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -220,11 +240,15 @@ impl NostrServerTransport {
         let relay_pool = Arc::clone(&self.base.relay_pool);
         let sessions = self.sessions.clone();
         let event_routes = self.event_routes.clone();
+        let request_wrap_kinds = self.request_wrap_kinds.clone();
         let tx = self.message_tx.clone();
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
         let is_announced_server = self.config.is_announced_server;
+        let server_info = self.config.server_info.clone();
+        let extra_common_tags = self.extra_common_tags.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
         tokio::spawn(async move {
@@ -232,11 +256,15 @@ impl NostrServerTransport {
                 relay_pool,
                 sessions,
                 event_routes,
+                request_wrap_kinds,
                 tx,
                 allowed,
                 excluded,
                 encryption_mode,
+                gift_wrap_mode,
                 is_announced_server,
+                server_info,
+                extra_common_tags,
                 seen_gift_wrap_ids,
             )
             .await;
@@ -245,6 +273,7 @@ impl NostrServerTransport {
         // Spawn session cleanup
         let sessions_cleanup = self.sessions.clone();
         let event_routes_cleanup = self.event_routes.clone();
+        let request_wrap_kinds_cleanup = self.request_wrap_kinds.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
 
@@ -255,6 +284,7 @@ impl NostrServerTransport {
                 let cleaned = Self::cleanup_sessions(
                     &sessions_cleanup,
                     &event_routes_cleanup,
+                    &request_wrap_kinds_cleanup,
                     session_timeout,
                 )
                 .await;
@@ -323,6 +353,15 @@ impl NostrServerTransport {
         let is_encrypted = session.is_encrypted;
         drop(sessions);
 
+        // CEP-19: Look up the incoming wrap kind for mirroring
+        let mirrored_wrap_kind = self
+            .request_wrap_kinds
+            .read()
+            .await
+            .get(event_id)
+            .copied()
+            .flatten();
+
         let client_pubkey = PublicKey::from_hex(&client_pubkey_hex).map_err(|error| {
             tracing::error!(
                 target: LOG_TARGET,
@@ -343,7 +382,23 @@ impl NostrServerTransport {
             Error::Other(error.to_string())
         })?;
 
-        let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        let mut tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+
+        // Send server info and capabilities on the first response.
+        let mut sent_common_tags = false;
+        let session_snapshot = self.sessions.get_session(&client_pubkey_hex).await;
+        if let Some(snap) = session_snapshot {
+            if !snap.has_sent_common_tags {
+                Self::append_common_response_tags(
+                    &mut tags,
+                    self.config.server_info.as_ref(),
+                    &self.extra_common_tags,
+                    self.config.encryption_mode,
+                    self.config.gift_wrap_mode,
+                );
+                sent_common_tags = true;
+            }
+        }
 
         if let Err(error) = self
             .base
@@ -353,7 +408,11 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
-                None,
+                Self::select_outbound_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                    mirrored_wrap_kind,
+                ),
             )
             .await
         {
@@ -377,6 +436,18 @@ impl NostrServerTransport {
 
             return Err(error);
         }
+
+        if sent_common_tags {
+            self.sessions
+                .mark_common_tags_sent(&client_pubkey_hex)
+                .await;
+        }
+
+        // Clean up only after successful send
+        self.event_routes.pop(event_id).await;
+
+        // Clean up wrap-kind tracking and reverse mapping
+        self.request_wrap_kinds.write().await.remove(event_id);
 
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(&client_pubkey_hex) {
@@ -411,6 +482,7 @@ impl NostrServerTransport {
             .get(client_pubkey_hex)
             .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
         let is_encrypted = session.is_encrypted;
+        let supports_ephemeral = session.supports_ephemeral_gift_wrap;
         drop(sessions);
 
         let client_pubkey =
@@ -422,6 +494,18 @@ impl NostrServerTransport {
             tags.push(Tag::event(event_id));
         }
 
+        // CEP-19: Look up mirrored wrap kind from correlated request
+        let correlated_wrap_kind = if let Some(event_id) = correlated_event_id {
+            self.request_wrap_kinds
+                .read()
+                .await
+                .get(event_id)
+                .copied()
+                .flatten()
+        } else {
+            None
+        };
+
         self.base
             .send_mcp_message(
                 notification,
@@ -429,7 +513,12 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
-                None,
+                Self::select_outbound_notification_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                    correlated_wrap_kind,
+                    supports_ephemeral,
+                ),
             )
             .await?;
 
@@ -464,6 +553,16 @@ impl NostrServerTransport {
         &mut self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>> {
         self.message_rx.take()
+    }
+
+    /// Sets extra discovery tags to include in announcements and first-response discovery replay.
+    pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
+        self.extra_common_tags = tags;
+    }
+
+    /// Sets pricing tags to include in announcement/list events and capability list responses.
+    pub fn set_announcement_pricing_tags(&mut self, tags: Vec<Tag>) {
+        self.pricing_tags = tags;
     }
 
     /// Publish server announcement (kind 11316).
@@ -506,11 +605,15 @@ impl NostrServerTransport {
                 TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
                 Vec::<String>::new(),
             ));
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                Vec::<String>::new(),
-            ));
+            if self.config.gift_wrap_mode.supports_ephemeral() {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                    Vec::<String>::new(),
+                ));
+            }
         }
+        tags.extend(self.extra_common_tags.iter().cloned());
+        tags.extend(self.pricing_tags.iter().cloned());
 
         let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
 
@@ -523,7 +626,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(TOOLS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -533,7 +637,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -543,7 +648,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(PROMPTS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -556,7 +662,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCETEMPLATES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -654,21 +761,38 @@ impl NostrServerTransport {
         relay_pool: Arc<dyn RelayPoolTrait>,
         sessions: SessionStore,
         event_routes: ServerEventRouteStore,
+        request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
         is_announced_server: bool,
+        server_info: Option<ServerInfo>,
+        extra_common_tags: Vec<Tag>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
         let mut notifications = relay_pool.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
+                let is_gift_wrap = event.kind == Kind::Custom(GIFT_WRAP_KIND)
+                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND);
+                let outer_kind: u16 = event.kind.as_u16();
+
+                // CEP-19: Drop gift-wraps that violate the configured gift-wrap mode
+                if is_gift_wrap && !gift_wrap_mode.allows_kind(outer_kind) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event_id = %event.id.to_hex(),
+                        event_kind = outer_kind,
+                        configured_mode = ?gift_wrap_mode,
+                        "Dropping gift-wrap because it violates gift_wrap_mode policy"
+                    );
+                    continue;
+                }
+
+                let (content, sender_pubkey, event_id, is_encrypted) = if is_gift_wrap {
                     if encryption_mode == EncryptionMode::Disabled {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -803,28 +927,44 @@ impl NostrServerTransport {
                             "Unauthorized request"
                         );
 
-                        // On announced servers, send a JSON-RPC error back for
-                        // Request messages so the client doesn't hang indefinitely.
+                        // Send a JSON-RPC error back for Request messages so the
+                        // client doesn't hang indefinitely (announced servers only).
                         if is_announced_server {
                             if let JsonRpcMessage::Request(ref req) = mcp_msg {
-                                let error_response =
-                                    JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
-                                        jsonrpc: "2.0".to_string(),
-                                        id: req.id.clone(),
-                                        error: JsonRpcError {
-                                            code: -32000,
-                                            message: "Unauthorized".to_string(),
-                                            data: None,
-                                        },
-                                    });
-
                                 if let Ok(client_pk) = PublicKey::from_hex(&sender_pubkey) {
                                     let event_id_parsed = EventId::from_hex(&event_id)
                                         .unwrap_or(EventId::all_zeros());
-                                    let tags = BaseTransport::create_response_tags(
+                                    let mut tags = BaseTransport::create_response_tags(
                                         &client_pk,
                                         &event_id_parsed,
                                     );
+
+                                    // CEP-19: Inject common discovery tags on first response
+                                    let has_sent = sessions
+                                        .get_session(&sender_pubkey)
+                                        .await
+                                        .map_or(false, |s| s.has_sent_common_tags);
+                                    if !has_sent {
+                                        Self::append_common_response_tags(
+                                            &mut tags,
+                                            server_info.as_ref(),
+                                            &extra_common_tags,
+                                            encryption_mode,
+                                            gift_wrap_mode,
+                                        );
+                                        sessions.mark_common_tags_sent(&sender_pubkey).await;
+                                    }
+
+                                    let error_response =
+                                        JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: req.id.clone(),
+                                            error: JsonRpcError {
+                                                code: -32000,
+                                                message: "Unauthorized".to_string(),
+                                                data: None,
+                                            },
+                                        });
 
                                     let base = BaseTransport {
                                         relay_pool: Arc::clone(&relay_pool),
@@ -838,7 +978,11 @@ impl NostrServerTransport {
                                             CTXVM_MESSAGES_KIND,
                                             tags,
                                             Some(is_encrypted),
-                                            None,
+                                            Self::select_outbound_gift_wrap_kind(
+                                                gift_wrap_mode,
+                                                is_encrypted,
+                                                if is_gift_wrap { Some(outer_kind) } else { None },
+                                            ),
                                         )
                                         .await
                                     {
@@ -851,7 +995,7 @@ impl NostrServerTransport {
                                     }
                                 }
                             }
-                        }
+                        } // if is_announced_server
 
                         continue;
                     }
@@ -864,6 +1008,11 @@ impl NostrServerTransport {
                     .or_insert_with(|| ClientSession::new(is_encrypted));
                 session.update_activity();
                 session.is_encrypted = is_encrypted;
+
+                // CEP-19: Mark ephemeral support if client used kind 21059
+                if is_gift_wrap && outer_kind == EPHEMERAL_GIFT_WRAP_KIND {
+                    session.supports_ephemeral_gift_wrap = true;
+                }
 
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
@@ -891,6 +1040,17 @@ impl NostrServerTransport {
                             .insert(event_id.clone(), token.clone());
                     }
 
+                    drop(sessions_w);
+
+                    // CEP-19: Record the incoming wrap kind for response mirroring
+                    {
+                        let mut kinds_w = request_wrap_kinds.write().await;
+                        kinds_w.insert(
+                            event_id.clone(),
+                            if is_gift_wrap { Some(outer_kind) } else { None },
+                        );
+                    }
+
                     event_routes
                         .register(
                             event_id.clone(),
@@ -899,16 +1059,19 @@ impl NostrServerTransport {
                             progress_token,
                         )
                         .await;
+                } else {
+                    drop(sessions_w);
                 }
 
-                // Handle initialized notification
+                // Handle initialized notification (re-acquire for write)
                 if let JsonRpcMessage::Notification(ref n) = mcp_msg {
                     if n.method == "notifications/initialized" {
-                        session.is_initialized = true;
+                        let mut sessions_w2 = sessions.write().await;
+                        if let Some(session) = sessions_w2.get_mut(&sender_pubkey) {
+                            session.is_initialized = true;
+                        }
                     }
                 }
-
-                drop(sessions_w);
 
                 // Forward to consumer
                 let _ = tx.send(IncomingRequest {
@@ -924,6 +1087,7 @@ impl NostrServerTransport {
     async fn cleanup_sessions(
         sessions: &SessionStore,
         event_routes: &ServerEventRouteStore,
+        request_wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
         timeout: Duration,
     ) -> usize {
         let mut sessions_w = sessions.write().await;
@@ -947,11 +1111,99 @@ impl NostrServerTransport {
         });
         drop(sessions_w);
 
+        {
+            let mut kinds_w = request_wrap_kinds.write().await;
+            for event_id in &stale_event_ids {
+                kinds_w.remove(event_id);
+            }
+        }
+
         for event_id in &stale_event_ids {
             event_routes.pop(event_id).await;
         }
 
         cleaned
+    }
+
+    /// CEP-19: Choose outbound gift-wrap kind for responses.
+    /// If `is_encrypted` is false, return None (send plaintext).
+    /// Otherwise mirror the kind used by the client, falling back to the mode default.
+    fn select_outbound_gift_wrap_kind(
+        mode: GiftWrapMode,
+        is_encrypted: bool,
+        mirrored_kind: Option<u16>,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+        if let Some(kind) = mirrored_kind {
+            if mode.allows_kind(kind) {
+                return Some(kind);
+            }
+        }
+        match mode {
+            GiftWrapMode::Persistent => Some(GIFT_WRAP_KIND),
+            GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
+            GiftWrapMode::Optional => Some(GIFT_WRAP_KIND),
+        }
+    }
+
+    /// CEP-19: Choose outbound gift-wrap kind for notifications.
+    fn select_outbound_notification_gift_wrap_kind(
+        mode: GiftWrapMode,
+        is_encrypted: bool,
+        correlated_wrap_kind: Option<u16>,
+        client_supports_ephemeral: bool,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+        // Mirror correlated request kind if available
+        if let Some(kind) = correlated_wrap_kind {
+            if mode.allows_kind(kind) {
+                return Some(kind);
+            }
+        }
+        // Fall back based on learned ephemeral support
+        if client_supports_ephemeral && mode.supports_ephemeral() {
+            return Some(EPHEMERAL_GIFT_WRAP_KIND);
+        }
+        match mode {
+            GiftWrapMode::Persistent => Some(GIFT_WRAP_KIND),
+            GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
+            GiftWrapMode::Optional => Some(GIFT_WRAP_KIND),
+        }
+    }
+
+    /// CEP-19: Append server capability discovery tags to the given tag vec.
+    fn append_common_response_tags(
+        tags: &mut Vec<Tag>,
+        server_info: Option<&ServerInfo>,
+        extra_common_tags: &[Tag],
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        if encryption_mode != EncryptionMode::Disabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
+                Vec::<String>::new(),
+            ));
+            if gift_wrap_mode.supports_ephemeral() {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                    Vec::<String>::new(),
+                ));
+            }
+        }
+        if let Some(info) = server_info {
+            if let Some(ref name) = info.name {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::NAME.into()),
+                    vec![name.clone()],
+                ));
+            }
+        }
+        tags.extend(extra_common_tags.iter().cloned());
     }
 }
 
@@ -967,6 +1219,8 @@ mod tests {
         let session = ClientSession::new(true);
         assert!(!session.is_initialized);
         assert!(session.is_encrypted);
+        assert!(!session.has_sent_common_tags);
+        assert!(!session.supports_ephemeral_gift_wrap);
         assert!(session.pending_requests.is_empty());
         assert!(session.event_to_progress_token.is_empty());
     }
@@ -1003,10 +1257,13 @@ mod tests {
             )
             .await;
 
+        let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
+
         // With a long timeout, nothing should be cleaned
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_secs(300),
         )
         .await;
@@ -1018,6 +1275,7 @@ mod tests {
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_millis(1),
         )
         .await;
@@ -1030,12 +1288,14 @@ mod tests {
     async fn test_cleanup_preserves_active_sessions() {
         let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
+        let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
 
         sessions.get_or_create_session("active", false).await;
 
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
+            &request_wrap_kinds,
             Duration::from_secs(300),
         )
         .await;
@@ -1176,11 +1436,214 @@ mod tests {
         let config = NostrServerTransportConfig::default();
         assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
         assert!(!config.is_announced_server);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(config.allowed_public_keys.is_empty());
         assert!(config.excluded_capabilities.is_empty());
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert!(config.server_info.is_none());
         assert!(config.log_file_path.is_none());
+    }
+
+    // ── CEP-19 helper logic ──────────────────────────────────────
+
+    #[test]
+    fn test_select_outbound_gift_wrap_kind_plaintext() {
+        // Plaintext: no encryption regardless of mode
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                false,
+                Some(GIFT_WRAP_KIND),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_gift_wrap_kind_mirrors_incoming() {
+        // Mirrors ephemeral kind when Optional mode allows it
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_gift_wrap_kind_persistent_mode_overrides_ephemeral() {
+        // Persistent mode: ephemeral mirror ignored, falls back to GIFT_WRAP_KIND
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Persistent,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_append_common_response_tags_includes_encryption_when_optional() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            None,
+            &[],
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let kinds: Vec<String> = tags.iter().map(|t| format!("{:?}", t.kind())).collect();
+        assert!(
+            kinds.iter().any(|k| k.contains("support_encryption")),
+            "should include support_encryption tag"
+        );
+    }
+
+    #[test]
+    fn test_append_common_response_tags_no_encryption_when_disabled() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            None,
+            &[],
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+        );
+        assert!(
+            tags.is_empty(),
+            "should not include encryption tags when encryption disabled"
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_plaintext() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                false,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_mirrors_correlated() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+                false,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_falls_back_to_mode_if_correlated_not_allowed() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                true,
+                Some(GIFT_WRAP_KIND),
+                false,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_uses_ephemeral_if_supported() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                None,
+                true,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_uses_persistent_if_ephemeral_supported_but_mode_persistent() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Persistent,
+                true,
+                None,
+                true,
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_uses_default_mode_if_ephemeral_not_supported() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                None,
+                false,
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_append_common_response_tags_includes_ephemeral_tag() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            None,
+            &[],
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let kinds: Vec<String> = tags.iter().map(|t| format!("{:?}", t.kind())).collect();
+        assert!(
+            kinds.iter().any(|k| k.contains("support_encryption_ephemeral")),
+            "should include support_encryption_ephemeral tag"
+        );
+    }
+
+    #[test]
+    fn test_append_common_response_tags_includes_server_info() {
+        let mut tags = Vec::new();
+        let server_info = ServerInfo {
+            name: Some("TestServer".to_string()),
+            ..Default::default()
+        };
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            Some(&server_info),
+            &[],
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+        );
+        let tag_value = crate::core::serializers::get_tag_value(&tags, "name");
+        assert_eq!(tag_value.as_deref(), Some("TestServer"));
+    }
+
+    #[test]
+    fn test_append_common_response_tags_extra_tags() {
+        let mut tags = Vec::new();
+        let extra_tags = vec![Tag::custom(TagKind::Custom("custom_tag".into()), vec!["value".to_string()])];
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            None,
+            &extra_tags,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+        );
+        let tag_value = crate::core::serializers::get_tag_value(&tags, "custom_tag");
+        assert_eq!(tag_value.as_deref(), Some("value"));
     }
 }

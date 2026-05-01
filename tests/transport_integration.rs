@@ -2329,3 +2329,193 @@ async fn announced_server_does_not_error_on_unauthorized_notification() {
         "announced server must not send error response for unauthorized notifications"
     );
 }
+
+// ── 31. First response includes discovery tags ──────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_response_includes_discovery_tags() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            is_announced_server: true,
+            server_info: Some(ServerInfo {
+                name: Some("Disco-Server".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: contextvm_sdk::core::types::GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Send first request (triggers first response with common tags)
+    let request1 = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("req-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request1).await.expect("send request 1");
+
+    let incoming1 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    let response1 = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("req-1"),
+        result: serde_json::json!({ "tools": [] }),
+    });
+    server
+        .send_response(&incoming1.event_id, response1)
+        .await
+        .expect("send response 1");
+
+    // Send second request (should NOT include common tags)
+    let request2 = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("req-2"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request2).await.expect("send request 2");
+
+    let incoming2 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    let response2 = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("req-2"),
+        result: serde_json::json!({ "tools": [] }),
+    });
+    server
+        .send_response(&incoming2.event_id, response2)
+        .await
+        .expect("send response 2");
+
+    let events = s_pool.stored_events().await;
+    let mut responses: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(contextvm_sdk::core::constants::CTXVM_MESSAGES_KIND))
+        .cloned()
+        .collect();
+    
+    let resp1 = responses.iter().find(|e| e.content.contains("req-1")).expect("resp1 missing");
+    let resp2 = responses.iter().find(|e| e.content.contains("req-2")).expect("resp2 missing");
+
+    let name1 = contextvm_sdk::core::serializers::get_tag_value(&resp1.tags, "name");
+    let enc1 = resp1.tags.iter().any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
+
+    let name2 = contextvm_sdk::core::serializers::get_tag_value(&resp2.tags, "name");
+    let enc2 = resp2.tags.iter().any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
+
+    assert_eq!(name1.as_deref(), Some("Disco-Server"));
+    assert!(enc1);
+
+    assert_eq!(name2, None);
+    assert!(!enc2);
+}
+
+// ── 32. Notification mirror selection wrt CEP 19 ──────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_mirror_selection_wrt_cep_19() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: contextvm_sdk::core::types::GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: contextvm_sdk::core::types::GiftWrapMode::Ephemeral, // Forces client to use Ephemeral
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Send a request. It should be encrypted and wrapped with Ephemeral (21059)
+    let request1 = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("req-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request1).await.expect("send request 1");
+
+    let incoming1 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Reply with a correlated notification
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/progress".to_string(),
+        params: None,
+    });
+    server
+        .send_notification(&incoming1.client_pubkey, &notification, Some(&incoming1.event_id))
+        .await
+        .expect("send notification");
+
+    // The notification should have been sent as an Ephemeral Gift Wrap (21059)
+    let events = s_pool.stored_events().await;
+    let ephemeral_wraps: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(contextvm_sdk::core::constants::EPHEMERAL_GIFT_WRAP_KIND))
+        .cloned()
+        .collect();
+    
+    // 1 from client (request), 1 from server (notification). The client also sends other msgs?
+    assert!(ephemeral_wraps.len() >= 2, "Expected ephemeral wraps for both request and notification");
+}
