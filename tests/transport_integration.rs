@@ -2406,10 +2406,15 @@ async fn first_response_includes_discovery_tags() {
     });
     client.send(&request2).await.expect("send request 2");
 
-    let incoming2 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+    let incoming2 = loop {
+        let msg = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        if msg.message.is_request() && msg.message.id() == Some(&serde_json::json!("req-2")) {
+            break msg;
+        }
+    };
 
     let response2 = JsonRpcMessage::Response(JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
@@ -2422,20 +2427,32 @@ async fn first_response_includes_discovery_tags() {
         .expect("send response 2");
 
     let events = s_pool.stored_events().await;
-    let mut responses: Vec<_> = events
+    let responses: Vec<_> = events
         .iter()
         .filter(|e| e.kind == Kind::Custom(contextvm_sdk::core::constants::CTXVM_MESSAGES_KIND))
         .cloned()
         .collect();
-    
-    let resp1 = responses.iter().find(|e| e.content.contains("req-1")).expect("resp1 missing");
-    let resp2 = responses.iter().find(|e| e.content.contains("req-2")).expect("resp2 missing");
+
+    let resp1 = responses
+        .iter()
+        .find(|e| e.content.contains("req-1") && e.content.contains("result"))
+        .expect("resp1 missing");
+    let resp2 = responses
+        .iter()
+        .find(|e| e.content.contains("req-2") && e.content.contains("result"))
+        .expect("resp2 missing");
 
     let name1 = contextvm_sdk::core::serializers::get_tag_value(&resp1.tags, "name");
-    let enc1 = resp1.tags.iter().any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
+    let enc1 = resp1
+        .tags
+        .iter()
+        .any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
 
     let name2 = contextvm_sdk::core::serializers::get_tag_value(&resp2.tags, "name");
-    let enc2 = resp2.tags.iter().any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
+    let enc2 = resp2
+        .tags
+        .iter()
+        .any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
 
     assert_eq!(name1.as_deref(), Some("Disco-Server"));
     assert!(enc1);
@@ -2504,7 +2521,11 @@ async fn notification_mirror_selection_wrt_cep_19() {
         params: None,
     });
     server
-        .send_notification(&incoming1.client_pubkey, &notification, Some(&incoming1.event_id))
+        .send_notification(
+            &incoming1.client_pubkey,
+            &notification,
+            Some(&incoming1.event_id),
+        )
         .await
         .expect("send notification");
 
@@ -2512,10 +2533,15 @@ async fn notification_mirror_selection_wrt_cep_19() {
     let events = s_pool.stored_events().await;
     let ephemeral_wraps: Vec<_> = events
         .iter()
-        .filter(|e| e.kind == Kind::Custom(contextvm_sdk::core::constants::EPHEMERAL_GIFT_WRAP_KIND))
+        .filter(|e| {
+            e.kind == Kind::Custom(contextvm_sdk::core::constants::EPHEMERAL_GIFT_WRAP_KIND)
+        })
         .cloned()
         .collect();
-    
+
     // 1 from client (request), 1 from server (notification). The client also sends other msgs?
-    assert!(ephemeral_wraps.len() >= 2, "Expected ephemeral wraps for both request and notification");
+    assert!(
+        ephemeral_wraps.len() >= 2,
+        "Expected ephemeral wraps for both request and notification"
+    );
 }

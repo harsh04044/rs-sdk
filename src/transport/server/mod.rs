@@ -943,7 +943,7 @@ impl NostrServerTransport {
                                     let has_sent = sessions
                                         .get_session(&sender_pubkey)
                                         .await
-                                        .map_or(false, |s| s.has_sent_common_tags);
+                                        .is_some_and(|s| s.has_sent_common_tags);
                                     if !has_sent {
                                         Self::append_common_response_tags(
                                             &mut tags,
@@ -1546,7 +1546,8 @@ mod tests {
     }
 
     #[test]
-    fn test_select_outbound_notification_gift_wrap_kind_falls_back_to_mode_if_correlated_not_allowed() {
+    fn test_select_outbound_notification_gift_wrap_kind_falls_back_to_mode_if_correlated_not_allowed(
+    ) {
         assert_eq!(
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Ephemeral,
@@ -1572,7 +1573,8 @@ mod tests {
     }
 
     #[test]
-    fn test_select_outbound_notification_gift_wrap_kind_uses_persistent_if_ephemeral_supported_but_mode_persistent() {
+    fn test_select_outbound_notification_gift_wrap_kind_uses_persistent_if_ephemeral_supported_but_mode_persistent(
+    ) {
         assert_eq!(
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Persistent,
@@ -1585,7 +1587,8 @@ mod tests {
     }
 
     #[test]
-    fn test_select_outbound_notification_gift_wrap_kind_uses_default_mode_if_ephemeral_not_supported() {
+    fn test_select_outbound_notification_gift_wrap_kind_uses_default_mode_if_ephemeral_not_supported(
+    ) {
         assert_eq!(
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Optional,
@@ -1609,7 +1612,9 @@ mod tests {
         );
         let kinds: Vec<String> = tags.iter().map(|t| format!("{:?}", t.kind())).collect();
         assert!(
-            kinds.iter().any(|k| k.contains("support_encryption_ephemeral")),
+            kinds
+                .iter()
+                .any(|k| k.contains("support_encryption_ephemeral")),
             "should include support_encryption_ephemeral tag"
         );
     }
@@ -1628,14 +1633,20 @@ mod tests {
             EncryptionMode::Disabled,
             GiftWrapMode::Optional,
         );
-        let tag_value = crate::core::serializers::get_tag_value(&tags, "name");
+        let tag_value = tags
+            .iter()
+            .find(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("name"))
+            .and_then(|t| t.clone().to_vec().get(1).cloned());
         assert_eq!(tag_value.as_deref(), Some("TestServer"));
     }
 
     #[test]
     fn test_append_common_response_tags_extra_tags() {
         let mut tags = Vec::new();
-        let extra_tags = vec![Tag::custom(TagKind::Custom("custom_tag".into()), vec!["value".to_string()])];
+        let extra_tags = vec![Tag::custom(
+            TagKind::Custom("custom_tag".into()),
+            vec!["value".to_string()],
+        )];
         NostrServerTransport::append_common_response_tags(
             &mut tags,
             None,
@@ -1643,7 +1654,10 @@ mod tests {
             EncryptionMode::Disabled,
             GiftWrapMode::Optional,
         );
-        let tag_value = crate::core::serializers::get_tag_value(&tags, "custom_tag");
+        let tag_value = tags
+            .iter()
+            .find(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("custom_tag"))
+            .and_then(|t| t.clone().to_vec().get(1).cloned());
         assert_eq!(tag_value.as_deref(), Some("value"));
     }
 }
