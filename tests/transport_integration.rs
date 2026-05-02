@@ -2865,3 +2865,199 @@ async fn server_disabled_encryption_omits_encryption_tags() {
         tags::SUPPORT_ENCRYPTION_EPHEMERAL
     ));
 }
+
+// ── CEP-35: Client-side discovery tag emission & capability learning ─────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disabled_encryption_emits_no_discovery_tags() {
+    // Disabled encryption: client must not emit cap tags. Positive case (Optional
+    // mode emits tags) is covered by unit test client_capability_tags_encryption_optional.
+    let pool = Arc::new(MockRelayPool::new());
+    let server_keys = Keys::generate();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_keys.public_key().to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // With Disabled encryption, no cap tags are emitted (correct per spec).
+    // Verify the event is published with p tag but without cap tags.
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let events = pool.stored_events().await;
+    let client_event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .expect("client must publish a request event");
+
+    // p tag must be present (routing)
+    assert!(has_tag_name(client_event, "p"));
+    // No encryption tags when Disabled (the unit test covers the Optional case)
+    assert!(
+        !has_tag_name(client_event, tags::SUPPORT_ENCRYPTION),
+        "Disabled client must not emit support_encryption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_second_request_carries_no_discovery_tags() {
+    // Second request must never carry discovery tags. One-shot flag behavior
+    // is covered by unit test client_discovery_tags_sent_once.
+    let pool = Arc::new(MockRelayPool::new());
+    let server_keys = Keys::generate();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_keys.public_key().to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // First request
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    // Second request
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(2),
+            method: "tools/list".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let events = pool.stored_events().await;
+    let ctxvm_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .collect();
+    assert!(ctxvm_events.len() >= 2);
+
+    let second_event = ctxvm_events
+        .iter()
+        .find(|e| e.content.contains("tools/list"))
+        .expect("second request event must exist");
+
+    assert!(
+        !has_tag_name(second_event, tags::SUPPORT_ENCRYPTION),
+        "second request must NOT include discovery tags"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_learns_server_capabilities_from_first_response() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            server_info: Some(ServerInfo {
+                name: Some("CapServer".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    let mut client_rx = client.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .unwrap();
+
+    // Client should have learned capabilities from server's first response
+    let caps = client.discovered_server_capabilities();
+    assert!(
+        caps.supports_encryption,
+        "client must learn support_encryption from server response tags"
+    );
+    assert!(
+        caps.supports_ephemeral_encryption,
+        "client must learn support_encryption_ephemeral from server response tags"
+    );
+
+    let baseline = client.get_server_initialize_event();
+    assert!(baseline.is_some(), "baseline event must be set");
+}
